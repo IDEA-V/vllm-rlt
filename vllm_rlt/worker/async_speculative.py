@@ -9,7 +9,7 @@ from vllm_rlt.config import ExecutionConfig
 from vllm_rlt.core.kv_cache_manager import _Allocation
 from vllm_rlt.core.scheduler import SchedulerOutput
 from vllm_rlt.request import Request
-from vllm_rlt.worker.sampler import RngRegistry
+from vllm_rlt.worker.sampler import RngRegistry, Sampler
 from vllm_rlt.worker.speculative import SpeculativeResult, SpeculativeRunner
 
 
@@ -36,6 +36,11 @@ class SpeculativeRoundBuffer:
         size = scheduler.max_num_batched_tokens + 2 * scheduler.max_num_seqs
         self.host_result = torch.empty(size, dtype=torch.int64, pin_memory=True)
         self.result = torch.empty(size, dtype=torch.int64, device=cache.device)
+        # FP32 target logprob of each verification row's argmax, copied only for
+        # rounds with a request that asked for logprobs.
+        rows = scheduler.max_num_batched_tokens
+        self.host_logprobs = torch.empty(rows, dtype=torch.float32, pin_memory=True)
+        self.logprobs = torch.empty(rows, dtype=torch.float32, device=cache.device)
         self.leased = False
         self.copy_done: torch.cuda.Event | None = None
         self.compute_done: torch.cuda.Event | None = None
@@ -49,6 +54,7 @@ class SpeculativeRoundTicket:
     states: tuple[SpeculativeRequestState, ...]
     rounds: tuple[int, ...]
     rows: int
+    logprobs_copied: bool = False
     cached: tuple[list[SpeculativeResult], list[int]] | None = None
 
     def ready(self):
@@ -61,14 +67,17 @@ class SpeculativeRoundTicket:
             self.bank.copy_done.synchronize()
             b = len(self.batch.items)
             values = self.bank.host_result[: self.rows + 2 * b].tolist()
+            scores = self.bank.host_logprobs[: self.rows].tolist() if self.logprobs_copied else None
             results, start = [], 0
             for i, item in enumerate(self.batch.items):
                 accepted = values[self.rows + i]
+                wants = scores is not None and item.request.sampling_params.logprobs is not None
                 results.append(
                     SpeculativeResult(
                         values[start : start + accepted + 1],
                         accepted,
                         item.token_count - 1,
+                        scores[start : start + accepted + 1] if wants else None,
                     )
                 )
                 start += item.token_count
@@ -100,8 +109,13 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         *,
         multi_stream=True,
         rng: RngRegistry | None = None,
+        logprobs_mode="raw_logprobs",
     ):
-        super().__init__(model, cache, config, ExecutionConfig(), rng=rng)
+        # Async speculation is greedy-only, and greedy rows report raw logprobs in
+        # both modes, so the mode never changes a score here.
+        super().__init__(
+            model, cache, config, ExecutionConfig(), rng=rng, logprobs_mode=logprobs_mode
+        )
         self.compute_stream = torch.cuda.Stream(device=self.device)
         self.copy_stream = (
             torch.cuda.Stream(device=self.device) if multi_stream else self.compute_stream
@@ -211,7 +225,11 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
                     candidates[i].append(proposed[row])
         return starts, candidates, hidden_rows
 
-    def _verify(self, items, starts, hidden_rows, tables, allocations):
+    def _verify(self, items, starts, hidden_rows, tables, allocations, *, score=False):
+        """Return (target, scores): the target argmax of every verification row and, with
+        ``score``, each row's FP32 raw logprob of that argmax (else None). Committed tokens
+        are exactly the target argmax of their rows.
+        """
         positions = torch.cat(
             [
                 start + torch.arange(item.token_count, device=self.device)
@@ -224,8 +242,9 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         hidden = torch.stack([h for rows in hidden_rows for h in rows])
         for depth in range(self.config.draft_loops, self.config.target_loops):
             hidden = self._execute_recurrent_step(hidden, positions, row_tables, depth, allocations)
-        target = self.model.coda(hidden).argmax(-1)
-        return target
+        logits = self.model.coda(hidden)
+        target = logits.argmax(-1)
+        return target, Sampler.raw_logprobs(logits, target) if score else None
 
     def _accept_and_update_state(self, items, states, starts, candidates, target, bank):
         count = len(target)
@@ -263,7 +282,12 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
                 self.submitted_before_collect += 1
             tables.copy_(host_tables, non_blocking=True)
             starts, candidates, hidden_rows = self._draft(items, states, tables, allocations)
-            target = self._verify(items, starts, hidden_rows, tables, allocations)
+            scoring = any(item.request.sampling_params.logprobs is not None for item in items)
+            target, scores = self._verify(
+                items, starts, hidden_rows, tables, allocations, score=scoring
+            )
+            if scoring:
+                bank.logprobs[: len(target)].copy_(scores)
             count = self._accept_and_update_state(items, states, starts, candidates, target, bank)
             bank.compute_done = torch.cuda.Event()
             bank.compute_done.record(self.compute_stream)
@@ -274,12 +298,14 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             self.copy_stream.wait_event(bank.compute_done)
             n = count + 2 * len(items)
             bank.host_result[:n].copy_(bank.result[:n], non_blocking=True)
+            if scoring:
+                bank.host_logprobs[:count].copy_(bank.logprobs[:count], non_blocking=True)
             bank.copy_done = torch.cuda.Event()
             bank.copy_done.record(self.copy_stream)
         self.stats.rounds += len(items)
         self.stats.drafted_tokens += sum(item.token_count - 1 for item in items)
         self.stats.verified_rows += count
-        return SpeculativeRoundTicket(batch, bank, states, rounds, count)
+        return SpeculativeRoundTicket(batch, bank, states, rounds, count, scoring)
 
     def request_ready(self, request):
         state = self.states.get(request.request_id)
